@@ -1,0 +1,56 @@
+site: suno
+name: refresh
+description: 验证 Suno 登录状态并查看剩余积分
+domain: suno.com
+strategy: cookie
+browser: true
+
+columns: [status, token_type, expires, credits_left]
+
+pipeline:
+  - navigate: https://suno.com/create
+  - wait: 5
+  - evaluate: |
+      (async () => {
+        try {
+          let token = null;
+          if (window.Clerk && window.Clerk.session) {
+            token = await window.Clerk.session.getToken();
+          }
+
+          if (!token) {
+            for (let i = 0; i < localStorage.length; i++) {
+              const key = localStorage.key(i);
+              if (key && key.includes('clerk-db-session')) {
+                const sessionData = JSON.parse(localStorage.getItem(key));
+                token = sessionData?.token;
+                break;
+              }
+            }
+          }
+
+          if (!token) {
+            return [{ status: 'Failed: Token not found. Please log in manually in Chrome.', token_type: 'none' }];
+          }
+
+          const response = await fetch('https://studio-api.prod.suno.com/api/get_limit/', {
+            headers: { 'Authorization': `Bearer ${token}` }
+          });
+
+          const credits = response.ok ? (await response.json()).credits_left : 'unknown';
+
+          return [{
+            status: 'Success',
+            token_type: 'JWT (Clerk)',
+            expires: 'Current Session',
+            credits_left: credits
+          }];
+        } catch (e) {
+          return [{ status: `Error: ${e.message}`, token_type: 'error' }];
+        }
+      })()
+  - map:
+      status: ${{ item.status }}
+      type: ${{ item.token_type }}
+      expires: ${{ item.expires }}
+      credits: ${{ item.credits_left }}

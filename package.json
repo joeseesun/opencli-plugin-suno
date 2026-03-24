@@ -1,0 +1,12 @@
+{
+  "name": "opencli-plugin-suno",
+  "version": "1.0.0",
+  "description": "OpenCLI plugin for Suno AI music generation",
+  "keywords": ["opencli", "opencli-plugin", "suno", "music", "ai"],
+  "author": "joeseesun",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/joeseesun/opencli-plugin-suno.git"
+  }
+}

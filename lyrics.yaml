@@ -1,0 +1,44 @@
+site: suno
+name: lyrics
+description: 获取歌曲的原始歌词文本
+domain: suno.com
+strategy: cookie
+browser: true
+
+args:
+  id:
+    type: string
+    required: true
+    description: "歌曲 ID"
+
+columns: [id, lyrics, status]
+
+pipeline:
+  - navigate: https://suno.com/create
+  - wait: 2
+  - evaluate: |
+      (async () => {
+        try {
+          const songId = "${{ args.id }}";
+          const response = await fetch(`https://studio-api.prod.suno.com/api/feed/?ids=${songId}`);
+          if (!response.ok) throw new Error(`Fetch failed: ${response.status}`);
+
+          const data = await response.json();
+          if (!data || data.length === 0) return [{ id: songId, lyrics: 'Not found' }];
+
+          const clip = data[0];
+          const lyrics = clip.metadata?.prompt || 'No lyrics found';
+
+          return [{
+            id: songId,
+            lyrics: lyrics,
+            status: clip.status
+          }];
+        } catch (e) {
+          return [{ id: 'error', lyrics: e.message }];
+        }
+      })()
+  - map:
+      id: ${{ item.id }}
+      lyrics: ${{ item.lyrics }}
+      status: ${{ item.status }}

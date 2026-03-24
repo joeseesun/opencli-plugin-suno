@@ -1,0 +1,192 @@
+site: suno
+name: download
+description: 下载 Suno 歌曲并同步歌词 (MP3, LRC, SRT)，每首歌保存在独立子目录
+domain: suno.com
+strategy: cookie
+browser: true
+
+args:
+  ids:
+    type: string
+    required: true
+    description: "歌曲 ID (多个 ID 用逗号分隔)"
+  dir:
+    type: string
+    required: false
+    description: "下载根目录 (默认: ~/Downloads)"
+
+columns: [id, title, mp3, lrc, srt]
+
+pipeline:
+  - navigate: https://suno.com/create
+  - wait: 2
+  - evaluate: |
+      (async () => {
+        let token = null;
+        if (window.Clerk && window.Clerk.session) {
+          token = await window.Clerk.session.getToken();
+        }
+        if (!token) throw new Error('JWT Token not found.');
+
+        const ids = ${{ args.ids | json }};
+        const feedResp = await fetch(`https://studio-api.prod.suno.com/api/feed/?ids=${ids}`, {
+          headers: { 'Authorization': `Bearer ${token}` }
+        });
+        const songs = await feedResp.json();
+
+        const results = [];
+        for (const song of songs) {
+          const safe_title = song.title.replace(/[\/\\:*?"<>|]/g, '').trim();
+
+          let lrc = '';
+          let srt = '';
+
+          try {
+            const lyricsResp = await fetch(
+              `https://studio-api.prod.suno.com/api/gen/${song.id}/aligned_lyrics/v2/`,
+              { headers: { 'Authorization': `Bearer ${token}` } }
+            );
+            const lyricsData = await lyricsResp.json();
+
+            if (lyricsData && lyricsData.aligned_words && lyricsData.aligned_words.length > 0) {
+              const words = lyricsData.aligned_words;
+              let merged = '';
+              const charTimes = [];
+              for (const w of words) {
+                merged += w.word;
+                const wLen = w.word.length;
+                for (let ci = 0; ci < wLen; ci++) {
+                  charTimes.push(w.start_s);
+                }
+              }
+
+              const skipSet = new Set();
+              const tagRe = /\[[^\]]*\]/g;
+              let m;
+              while ((m = tagRe.exec(merged)) !== null) {
+                for (let i = m.index; i < m.index + m[0].length; i++) {
+                  skipSet.add(i);
+                }
+              }
+
+              const lines = [];
+              let lineText = '';
+              let lineStart = null;
+
+              for (let ci = 0; ci < merged.length; ci++) {
+                if (skipSet.has(ci)) continue;
+                const ch = merged[ci];
+                if (ch === '\n') {
+                  if (lineText.trim()) {
+                    lines.push({ text: lineText.trim(), start: lineStart });
+                    lineText = '';
+                    lineStart = null;
+                  }
+                } else {
+                  if (lineStart === null) lineStart = charTimes[ci];
+                  lineText += ch;
+                }
+              }
+              if (lineText.trim()) {
+                lines.push({ text: lineText.trim(), start: lineStart });
+              }
+
+              for (let i = 0; i < lines.length; i++) {
+                lines[i].end = (i + 1 < lines.length) ? lines[i + 1].start : lines[i].start + 3;
+              }
+
+              const toMMSS = (s) => {
+                const min = Math.floor(s / 60);
+                const sec = (s % 60).toFixed(2).padStart(5, '0');
+                return `${String(min).padStart(2, '0')}:${sec}`;
+              };
+              lrc = lines.map(l => `[${toMMSS(l.start)}]${l.text}`).join('\n');
+
+              const toSRTTime = (s) => {
+                const h = Math.floor(s / 3600);
+                const mm = Math.floor((s % 3600) / 60);
+                const sec = Math.floor(s % 60);
+                const ms = Math.round((s % 1) * 1000);
+                return `${String(h).padStart(2,'0')}:${String(mm).padStart(2,'0')}:${String(sec).padStart(2,'0')},${String(ms).padStart(3,'0')}`;
+              };
+              srt = lines.map((l, i) =>
+                `${i+1}\n${toSRTTime(l.start)} --> ${toSRTTime(l.end)}\n${l.text}`
+              ).join('\n\n');
+            }
+          } catch (e) {}
+
+          results.push({
+            id: song.id,
+            title: song.title,
+            safe_title,
+            audio_url: song.audio_url || '',
+            lrc,
+            srt
+          });
+        }
+
+        // 同名歌曲加 -1, -2 后缀区分
+        const titleCount = {};
+        for (const r of results) titleCount[r.safe_title] = (titleCount[r.safe_title] || 0) + 1;
+        const titleIndex = {};
+        for (const r of results) {
+          if (titleCount[r.safe_title] > 1) {
+            titleIndex[r.safe_title] = (titleIndex[r.safe_title] || 0) + 1;
+            r.safe_title = `${r.safe_title}-${titleIndex[r.safe_title]}`;
+          }
+        }
+
+        return results;
+      })()
+
+  # 下载 MP3（yt-dlp 绕过 TLS 指纹），保存到 {dir}/{safe_title}/{safe_title}.mp3
+  - download:
+      url: ${{ item.audio_url }}
+      dir: ${{ args.dir || (process.env.HOME + '/Downloads') }}
+      filename: ${{ item.safe_title }}/${{ item.safe_title }}.mp3
+      use_ytdlp: true
+      timeout: 120
+
+  # 保存 MP3 结果，恢复歌词字段（download 后 item 只剩 _download）
+  - map:
+      id: ${{ item.id }}
+      title: ${{ item.title }}
+      safe_title: ${{ item.safe_title }}
+      audio_url: ${{ item.audio_url }}
+      lrc: ${{ item.lrc }}
+      srt: ${{ item.srt }}
+      mp3: ${{ item._download.status }}
+
+  # 写入 LRC 文件
+  - download:
+      url: ${{ item.audio_url }}
+      dir: ${{ args.dir || (process.env.HOME + '/Downloads') }}
+      filename: ${{ item.safe_title }}/${{ item.safe_title }}.lrc
+      type: document
+      content: ${{ item.lrc }}
+
+  # 保存 LRC 结果，恢复字段
+  - map:
+      id: ${{ item.id }}
+      title: ${{ item.title }}
+      safe_title: ${{ item.safe_title }}
+      audio_url: ${{ item.audio_url }}
+      srt: ${{ item.srt }}
+      mp3: ${{ item.mp3 }}
+      lrc: ${{ item._download.status }}
+
+  # 写入 SRT 文件
+  - download:
+      url: ${{ item.audio_url }}
+      dir: ${{ args.dir || (process.env.HOME + '/Downloads') }}
+      filename: ${{ item.safe_title }}/${{ item.safe_title }}.srt
+      type: document
+      content: ${{ item.srt }}
+
+  # 最终汇总
+  - map:
+      id: ${{ item.id }}
+      title: ${{ item.title }}
+      mp3: ${{ item.mp3 }}
+      lrc: ${{ item.lrc }}
+      srt: ${{ item._download.status }}
