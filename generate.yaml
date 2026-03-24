@@ -1,10 +1,10 @@
 site: suno
 name: generate
-description: 生成音乐 + 自动等待完成 + 下载 MP3/LRC/SRT 到各自子目录
+description: 提交音乐生成任务，返回新歌 ID（生成需 1-3 分钟，完成后用 suno download 下载）
 domain: suno.com
 strategy: cookie
 browser: true
-timeout: 360
+timeout: 60
 
 args:
   prompt:
@@ -19,12 +19,8 @@ args:
     type: string
     default: "Untitled"
     description: "歌曲标题"
-  dir:
-    type: string
-    required: false
-    description: "下载根目录 (默认: ~/Downloads)"
 
-columns: [id, title, mp3, lrc, srt]
+columns: [id, title, status]
 
 pipeline:
   - navigate: https://suno.com/create
@@ -40,26 +36,17 @@ pipeline:
         if (window.Clerk && window.Clerk.session) {
           token = await window.Clerk.session.getToken();
         }
-        if (!token) throw new Error('JWT Token not found.');
+        if (!token) throw new Error('JWT Token not found. Please log in to Suno in Chrome.');
 
-        // 2. 生成前快照，用于识别新歌（带 retry，应对限流）
+        // 2. 生成前快照（记录已有 ID，用于识别新歌）
         let existingIds = new Set();
-        for (let retry = 0; retry < 5; retry++) {
-          if (retry > 0) await new Promise(r => setTimeout(r, 3000 * retry));
-          try {
-            const preResp = await fetch('https://studio-api.prod.suno.com/api/feed/v2?page_size=20', {
-              headers: { 'Authorization': `Bearer ${token}` }
-            });
-            const text = await preResp.text();
-            const preData = JSON.parse(text);
-            existingIds = new Set((preData.clips || []).map(s => s.id));
-            break;
-          } catch(e) {
-            if (retry === 4) {
-              existingIds = new Set();
-            }
-          }
-        }
+        try {
+          const preResp = await fetch('https://studio-api.prod.suno.com/api/feed/v2?page_size=20', {
+            headers: { 'Authorization': `Bearer ${token}` }
+          });
+          const preData = await preResp.json();
+          existingIds = new Set((preData.clips || []).map(s => s.id));
+        } catch(e) {}
 
         // 3. 强制改写 React 受控组件
         const forceSetValue = (el, value) => {
@@ -84,7 +71,7 @@ pipeline:
           }
         }
 
-        // 5. 填写表单：歌词=textareas[0]，风格=textareas[1]，标题=input
+        // 5. 填写表单
         const inputs = Array.from(document.querySelectorAll('textarea, input'));
         const textareas = inputs.filter(i => i.tagName === 'TEXTAREA');
         const lyricsInput = textareas[0];
@@ -107,10 +94,7 @@ pipeline:
         }
         if (!createBtn) throw new Error('Create button not found or still disabled.');
 
-        createBtn.scrollIntoView();
-        const createTime = Date.now() / 1000;
-
-        // 幂等检查：用 localStorage + 10 分钟 TTL 防止 evaluate retry 重复提交
+        // 7. 幂等检查：防止重复提交
         const idempotencyKey = `suno_create_${title}`;
         const lastCreateTime = localStorage.getItem(idempotencyKey);
         let alreadySubmitted = lastCreateTime && (Date.now() - parseInt(lastCreateTime)) < 600000;
@@ -122,184 +106,48 @@ pipeline:
             });
             const checkData = await checkResp.json();
             const tenMinAgo = (Date.now() / 1000) - 600;
-            const recentSameTitleSongs = (checkData.clips || []).filter(s =>
+            const recent = (checkData.clips || []).filter(s =>
               s.title === title &&
-              (
-                ['submitted', 'queued', 'streaming'].includes(s.status) ||
-                (s.status === 'complete' && s.created_at && s.created_at > tenMinAgo)
-              )
+              (['submitted', 'queued', 'streaming'].includes(s.status) ||
+               (s.status === 'complete' && s.created_at && s.created_at > tenMinAgo))
             );
-            if (recentSameTitleSongs.length > 0) alreadySubmitted = true;
+            if (recent.length > 0) alreadySubmitted = true;
           } catch(e) {}
         }
 
         if (!alreadySubmitted) {
+          createBtn.scrollIntoView();
           createBtn.click();
           localStorage.setItem(idempotencyKey, String(Date.now()));
         }
 
-        // 7. 轮询等待生成完成（最多 5 分钟，每 2 秒一次）
-        let doneSongs = [];
-        for (let attempt = 0; attempt < 150; attempt++) {
-          await new Promise(r => setTimeout(r, 2000));
+        // 8. 等待 15 秒，抓取新出现的 ID（不等完成）
+        await new Promise(r => setTimeout(r, 15000));
 
-          if (attempt > 0 && attempt % 60 === 0) {
-            try { token = await window.Clerk.session.getToken(); } catch(e) {}
-          }
-
-          const feedResp = await fetch('https://studio-api.prod.suno.com/api/feed/v2?page_size=20', {
-            headers: { 'Authorization': `Bearer ${token}` }
-          });
-          let feedData;
+        let newIds = [];
+        for (let attempt = 0; attempt < 6; attempt++) {
           try {
-            const text = await feedResp.text();
-            feedData = JSON.parse(text);
-          } catch(e) {
-            continue;
-          }
-
-          const newClips = (feedData.clips || []).filter(s => {
-            if (existingIds.size > 0) return !existingIds.has(s.id);
-            return s.created_at && s.created_at > createTime;
-          });
-
-          if (newClips.length === 0) continue;
-
-          const titleMatched = newClips.filter(s => s.title === title);
-          const candidates = (titleMatched.length > 0)
-            ? titleMatched
-            : (existingIds.size > 0 ? newClips : []);
-
-          const anyError = candidates.some(s => s.status === 'error');
-          if (anyError) {
-            const errSong = candidates.find(s => s.status === 'error');
-            throw new Error('Generation failed: ' + (errSong?.metadata?.error_message || 'unknown error'));
-          }
-
-          const completed = candidates.filter(s => s.status === 'complete');
-          if (completed.length >= 2 || (completed.length >= 1 && attempt >= 60)) {
-            doneSongs = completed;
-            break;
-          }
-        }
-
-        if (doneSongs.length === 0) throw new Error('Timeout: songs did not complete within 5 minutes.');
-
-        // 8. 获取对齐歌词 (LRC + SRT)
-        const results = [];
-        for (const song of doneSongs) {
-          const safe_title = song.title.replace(/[\/\\:*?"<>|]/g, '').trim();
-          let lrc = '';
-          let srt = '';
-
-          try {
-            const lyricsResp = await fetch(
-              `https://studio-api.prod.suno.com/api/gen/${song.id}/aligned_lyrics/v2/`,
-              { headers: { 'Authorization': `Bearer ${token}` } }
-            );
-            const lyricsData = await lyricsResp.json();
-
-            if (lyricsData && lyricsData.aligned_words && lyricsData.aligned_words.length > 0) {
-              const words = lyricsData.aligned_words;
-              let merged = '';
-              const charTimes = [];
-              for (const w of words) {
-                merged += w.word;
-                for (let ci = 0; ci < w.word.length; ci++) charTimes.push(w.start_s);
-              }
-              const skipSet = new Set();
-              const tagRe = /\[[^\]]*\]/g;
-              let m;
-              while ((m = tagRe.exec(merged)) !== null) {
-                for (let i = m.index; i < m.index + m[0].length; i++) skipSet.add(i);
-              }
-              const lines = [];
-              let lineText = '', lineStart = null;
-              for (let ci = 0; ci < merged.length; ci++) {
-                if (skipSet.has(ci)) continue;
-                const ch = merged[ci];
-                if (ch === '\n') {
-                  if (lineText.trim()) { lines.push({ text: lineText.trim(), start: lineStart }); lineText = ''; lineStart = null; }
-                } else {
-                  if (lineStart === null) lineStart = charTimes[ci];
-                  lineText += ch;
-                }
-              }
-              if (lineText.trim()) lines.push({ text: lineText.trim(), start: lineStart });
-              for (let i = 0; i < lines.length; i++) {
-                lines[i].end = (i + 1 < lines.length) ? lines[i + 1].start : lines[i].start + 3;
-              }
-              const toMMSS = s => { const min = Math.floor(s / 60), sec = (s % 60).toFixed(2).padStart(5, '0'); return `${String(min).padStart(2, '0')}:${sec}`; };
-              lrc = lines.map(l => `[${toMMSS(l.start)}]${l.text}`).join('\n');
-              const toSRTTime = s => { const h = Math.floor(s / 3600), mm = Math.floor((s % 3600) / 60), sec = Math.floor(s % 60), ms = Math.round((s % 1) * 1000); return `${String(h).padStart(2, '0')}:${String(mm).padStart(2, '0')}:${String(sec).padStart(2, '0')},${String(ms).padStart(3, '0')}`; };
-              srt = lines.map((l, i) => `${i + 1}\n${toSRTTime(l.start)} --> ${toSRTTime(l.end)}\n${l.text}`).join('\n\n');
-            }
+            const feedResp = await fetch('https://studio-api.prod.suno.com/api/feed/v2?page_size=20', {
+              headers: { 'Authorization': `Bearer ${token}` }
+            });
+            const feedData = await feedResp.json();
+            const clips = feedData.clips || [];
+            newIds = clips
+              .filter(s => !existingIds.has(s.id))
+              .map(s => ({ id: s.id, title: s.title || title, status: s.status }));
+            if (newIds.length > 0) break;
           } catch(e) {}
-
-          results.push({ id: song.id, title: song.title, safe_title, audio_url: song.audio_url || '', lrc, srt });
+          await new Promise(r => setTimeout(r, 3000));
         }
 
-        // 同名歌曲加 -1, -2 后缀
-        const titleCount = {};
-        for (const r of results) titleCount[r.safe_title] = (titleCount[r.safe_title] || 0) + 1;
-        const titleIndex = {};
-        for (const r of results) {
-          if (titleCount[r.safe_title] > 1) {
-            titleIndex[r.safe_title] = (titleIndex[r.safe_title] || 0) + 1;
-            r.safe_title = `${r.safe_title}-${titleIndex[r.safe_title]}`;
-          }
+        if (newIds.length === 0) {
+          return [{ id: 'pending', title: title, status: 'submitted - check suno history in 1-2 min' }];
         }
 
-        return results;
+        return newIds;
       })()
 
-  # 下载 MP3
-  - download:
-      url: ${{ item.audio_url }}
-      dir: ${{ args.dir || (process.env.HOME + '/Downloads') }}
-      filename: ${{ item.safe_title }}/${{ item.safe_title }}.mp3
-      use_ytdlp: true
-      timeout: 120
-
-  # 保存 MP3 结果，恢复歌词字段
   - map:
       id: ${{ item.id }}
       title: ${{ item.title }}
-      safe_title: ${{ item.safe_title }}
-      audio_url: ${{ item.audio_url }}
-      lrc: ${{ item.lrc }}
-      srt: ${{ item.srt }}
-      mp3: ${{ item._download.status }}
-
-  # 写入 LRC
-  - download:
-      url: ${{ item.audio_url }}
-      dir: ${{ args.dir || (process.env.HOME + '/Downloads') }}
-      filename: ${{ item.safe_title }}/${{ item.safe_title }}.lrc
-      type: document
-      content: ${{ item.lrc }}
-
-  - map:
-      id: ${{ item.id }}
-      title: ${{ item.title }}
-      safe_title: ${{ item.safe_title }}
-      audio_url: ${{ item.audio_url }}
-      srt: ${{ item.srt }}
-      mp3: ${{ item.mp3 }}
-      lrc: ${{ item._download.status }}
-
-  # 写入 SRT
-  - download:
-      url: ${{ item.audio_url }}
-      dir: ${{ args.dir || (process.env.HOME + '/Downloads') }}
-      filename: ${{ item.safe_title }}/${{ item.safe_title }}.srt
-      type: document
-      content: ${{ item.srt }}
-
-  # 最终汇总
-  - map:
-      id: ${{ item.id }}
-      title: ${{ item.title }}
-      mp3: ${{ item.mp3 }}
-      lrc: ${{ item.lrc }}
-      srt: ${{ item._download.status }}
+      status: ${{ item.status }}
