@@ -139,10 +139,10 @@ pipeline:
         return results;
       })()
 
-  # 下载 MP3（yt-dlp 绕过 TLS 指纹），子目录名拼入 dir，filename 只留文件名
+  # 下载 MP3（yt-dlp 绕过 TLS 指纹）
   - download:
       url: ${{ item.audio_url }}
-      dir: ${{ (args.dir || (process.env.HOME + '/Downloads')) + '/' + item.safe_title }}
+      dir: ${{ args.dir || (process.env.HOME + '/Downloads') }}
       filename: ${{ item.safe_title }}.mp3
       use_ytdlp: true
       timeout: 120
@@ -160,7 +160,7 @@ pipeline:
   # 写入 LRC 文件
   - download:
       url: ${{ item.audio_url }}
-      dir: ${{ (args.dir || (process.env.HOME + '/Downloads')) + '/' + item.safe_title }}
+      dir: ${{ args.dir || (process.env.HOME + '/Downloads') }}
       filename: ${{ item.safe_title }}.lrc
       type: document
       content: ${{ item.lrc }}
@@ -178,7 +178,7 @@ pipeline:
   # 写入 SRT 文件
   - download:
       url: ${{ item.audio_url }}
-      dir: ${{ (args.dir || (process.env.HOME + '/Downloads')) + '/' + item.safe_title }}
+      dir: ${{ args.dir || (process.env.HOME + '/Downloads') }}
       filename: ${{ item.safe_title }}.srt
       type: document
       content: ${{ item.srt }}
@@ -187,6 +187,7 @@ pipeline:
   - map:
       id: ${{ item.id }}
       title: ${{ item.title }}
+      safe_title: ${{ item.safe_title }}
       mp3: ${{ item.mp3 }}
       lrc: ${{ item.lrc }}
       srt: ${{ item._download.status }}
